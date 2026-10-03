@@ -71,6 +71,7 @@ expect "$out" '"completed_turns":2'
 out=$(call claude_output "{\"id\":\"$ID\",\"since\":0}")
 expect "$out" 'prompt: hello'
 expect "$out" 'stderr: fake_claude: turn'
+if grep -qE 'rate_limit_event|thinking_tokens' <<<"$out"; then echo "FAIL: noise events leaked into transcript" >&2; exit 1; fi
 
 out=$(call claude_list '{}')
 expect "$out" "\"id\":\"$ID\""

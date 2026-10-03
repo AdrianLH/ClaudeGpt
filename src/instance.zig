@@ -468,6 +468,7 @@ pub const Instance = struct {
 
         if (eql(typ, "system")) {
             const sub = jsonx.getStr(v, "subtype") orelse "";
+            if (isNoise(typ, sub)) return;
             if (!eql(sub, "init")) return self.pushEvent("system", sub);
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -524,6 +525,8 @@ pub const Instance = struct {
             self.appendEventLocked(if (is_error) "result_error" else "result", result);
         } else if (eql(typ, "control_response")) {
             self.pushEvent("control", clip(line, max_detail_text));
+        } else if (isNoise(typ, "")) {
+            // Telemetry that would only burn the caller's context.
         } else if (eql(typ, "stream_event")) {
             // Partial deltas; only emitted with --include-partial-messages.
         } else {
@@ -597,6 +600,24 @@ fn toolResultText(arena: Allocator, content: ?json.Value) ![]const u8 {
         },
         else => return json.Stringify.valueAlloc(arena, c, .{}),
     }
+}
+
+/// Messages claude emits for its own UI (token counters, rate-limit status, hook
+/// progress) that carry nothing a remote caller needs.
+fn isNoise(typ: []const u8, subtype: []const u8) bool {
+    if (eql(typ, "rate_limit_event")) return true;
+    if (!eql(typ, "system")) return false;
+    return eql(subtype, "thinking_tokens") or eql(subtype, "status") or
+        std.mem.startsWith(u8, subtype, "hook_");
+}
+
+test isNoise {
+    try std.testing.expect(isNoise("rate_limit_event", ""));
+    try std.testing.expect(isNoise("system", "thinking_tokens"));
+    try std.testing.expect(isNoise("system", "hook_started"));
+    try std.testing.expect(!isNoise("system", "init"));
+    try std.testing.expect(!isNoise("system", "compact_boundary"));
+    try std.testing.expect(!isNoise("assistant", ""));
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

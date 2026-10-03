@@ -45,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
             try emit(arena, out, .{ .type = "system", .subtype = "init", .session_id = session, .model = "fake-model" });
         }
         turns += 1;
+        // Noise real claude emits; the server should drop it.
+        try emit(arena, out, .{ .type = "rate_limit_event", .session_id = session });
+        try emit(arena, out, .{ .type = "system", .subtype = "thinking_tokens", .session_id = session });
         const prompt = msg.object.get("message").?.object.get("content").?.string;
         const reply = try std.fmt.allocPrint(arena, "echo: {s}", .{prompt});
         std.debug.print("fake_claude: turn {d}\n", .{turns});
