@@ -2,6 +2,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const Instance = @import("instance.zig").Instance;
 
 pub const Config = struct {
@@ -10,6 +11,8 @@ pub const Config = struct {
     roots: []const []const u8 = &.{},
     max_live: usize = 8,
     allow_bypass: bool = false,
+    /// Environment for claude processes; null inherits the server's.
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const StartOptions = struct {
@@ -22,13 +25,14 @@ pub const StartOptions = struct {
 
 pub const Registry = struct {
     gpa: Allocator,
+    io: Io,
     cfg: Config,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
     /// Insertion-ordered, so eviction drops the oldest exited instance first.
     map: std.StringArrayHashMapUnmanaged(*Instance) = .empty,
 
-    pub fn init(gpa: Allocator, cfg: Config) Registry {
-        return .{ .gpa = gpa, .cfg = cfg };
+    pub fn init(gpa: Allocator, io: Io, cfg: Config) Registry {
+        return .{ .gpa = gpa, .io = io, .cfg = cfg };
     }
 
     pub fn deinit(self: *Registry) void {
@@ -44,8 +48,8 @@ pub const Registry = struct {
         const cwd = try self.resolveCwd(opts.cwd);
         defer self.gpa.free(cwd);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var live: usize = 0;
         for (self.map.values()) |inst| {
@@ -57,13 +61,13 @@ pub const Registry = struct {
         var id: [8]u8 = undefined;
         while (true) {
             var bytes: [4]u8 = undefined;
-            std.crypto.random.bytes(&bytes);
+            self.io.random(&bytes);
             id = std.fmt.bytesToHex(bytes, .lower);
             if (!self.map.contains(&id)) break;
         }
 
         try self.map.ensureUnusedCapacity(self.gpa, 1);
-        const inst = try Instance.spawn(self.gpa, .{
+        const inst = try Instance.spawn(self.gpa, self.io, .{
             .id = id,
             .claude_path = self.cfg.claude_path,
             .cwd = cwd,
@@ -71,6 +75,7 @@ pub const Registry = struct {
             .permission_mode = opts.permission_mode,
             .allowed_tools = opts.allowed_tools,
             .resume_session_id = opts.resume_session_id,
+            .environ_map = self.cfg.environ_map,
         });
         self.map.putAssumeCapacity(inst.id(), inst);
         inst.retain();
@@ -79,8 +84,8 @@ pub const Registry = struct {
 
     /// Returned instance is retained; call `release`.
     pub fn get(self: *Registry, id: []const u8) ?*Instance {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const inst = self.map.get(id) orelse return null;
         inst.retain();
         return inst;
@@ -88,8 +93,8 @@ pub const Registry = struct {
 
     /// Every returned instance is retained; release each.
     pub fn list(self: *Registry, arena: Allocator) ![]*Instance {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const out = try arena.dupe(*Instance, self.map.values());
         for (out) |inst| inst.retain();
         return out;
@@ -107,12 +112,13 @@ pub const Registry = struct {
     }
 
     /// Canonical path of `path` if it is an existing directory under an allowed root.
-    pub fn resolveCwd(self: *Registry, path: []const u8) ![]u8 {
+    pub fn resolveCwd(self: *Registry, path: []const u8) ![:0]u8 {
         if (!std.fs.path.isAbsolute(path)) return error.CwdNotAbsolute;
-        const real = std.fs.cwd().realpathAlloc(self.gpa, path) catch return error.CwdNotFound;
+        const cwd = Io.Dir.cwd();
+        const real = cwd.realPathFileAlloc(self.io, path, self.gpa) catch return error.CwdNotFound;
         errdefer self.gpa.free(real);
-        var dir = std.fs.cwd().openDir(real, .{}) catch return error.CwdNotDirectory;
-        dir.close();
+        const dir = cwd.openDir(self.io, real, .{}) catch return error.CwdNotDirectory;
+        dir.close(self.io);
         for (self.cfg.roots) |root| {
             if (isUnder(real, root)) return real;
         }
@@ -146,15 +152,16 @@ test isUnder {
 
 test "resolveCwd enforces roots" {
     const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makeDir("inside");
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    try tmp.dir.createDir(io, "inside", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
     const inside = try std.fs.path.join(gpa, &.{ root, "inside" });
     defer gpa.free(inside);
 
-    var reg = Registry.init(gpa, .{ .roots = &.{inside} });
+    var reg = Registry.init(gpa, io, .{ .roots = &.{inside} });
     defer reg.deinit();
 
     const ok = try reg.resolveCwd(inside);

@@ -2,9 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    // std.Io / std.net / std.json APIs used here are the 0.15 ones.
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 15)
-        @compileError("claudegpt targets Zig 0.15.x");
+    // Written against the 0.16 std.Io API (process.Init, Io.net, Io.Mutex, ...).
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16)
+        @compileError("claudegpt targets Zig 0.16.x");
 }
 
 pub fn build(b: *std.Build) void {

@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const jsonx = @import("jsonx.zig");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const json = std.json;
 
 pub const State = enum { running, idle, exited };
@@ -50,32 +51,40 @@ pub const Options = struct {
     permission_mode: []const u8 = "default",
     allowed_tools: []const []const u8 = &.{},
     resume_session_id: ?[]const u8 = null,
+    /// Environment for claude; null inherits the server's.
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 const max_events = 2000;
 const max_event_text = 8 * 1024;
 const max_detail_text = 2 * 1024;
-const max_line = 16 * 1024 * 1024;
+const stdout_buffer_len = 1024 * 1024;
+const stderr_buffer_len = 64 * 1024;
 
 pub const Instance = struct {
     gpa: Allocator,
+    io: Io,
     id_buf: [8]u8,
     cwd: []u8,
     model: ?[]u8,
     permission_mode: []u8,
     started_ms: i64,
     child: std.process.Child,
+    /// Copied at spawn; child.id is cleared by the reaping thread.
+    pid: std.process.Child.Id,
     thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
     refs: std.atomic.Value(u32) = .init(1),
 
     /// Guards child.stdin and next_request_id. Never held together with `mutex`:
     /// a blocking pipe write must not stall the reader thread, or claude can
     /// deadlock writing to a full stdout pipe.
-    stdin_mutex: std.Thread.Mutex = .{},
+    stdin_mutex: Io.Mutex = .init,
     next_request_id: u32 = 0,
 
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: Io.Mutex = .init,
+    /// Bumped and futex-woken on every change; std.Io.Condition has no timed wait.
+    generation: std.atomic.Value(u32) = .init(0),
     state: State = .idle,
     session_id: ?[]u8 = null,
     events: std.ArrayList(Event) = .empty,
@@ -87,7 +96,7 @@ pub const Instance = struct {
     last_result_is_error: bool = false,
     exit_code: ?i64 = null,
 
-    pub fn spawn(gpa: Allocator, opts: Options) !*Instance {
+    pub fn spawn(gpa: Allocator, io: Io, opts: Options) !*Instance {
         const self = try gpa.create(Instance);
         errdefer gpa.destroy(self);
 
@@ -108,11 +117,6 @@ pub const Instance = struct {
             try argv.appendSlice(gpa, opts.allowed_tools);
         }
 
-        // Don't leak the server's bearer token into the agent's environment.
-        var env = try std.process.getEnvMap(gpa);
-        defer env.deinit();
-        env.remove("CLAUDEGPT_TOKEN");
-
         const cwd = try gpa.dupe(u8, opts.cwd);
         errdefer gpa.free(cwd);
         const model = if (opts.model) |m| try gpa.dupe(u8, m) else null;
@@ -122,23 +126,33 @@ pub const Instance = struct {
 
         self.* = .{
             .gpa = gpa,
+            .io = io,
             .id_buf = opts.id,
             .cwd = cwd,
             .model = model,
             .permission_mode = pm,
-            .started_ms = std.time.milliTimestamp(),
-            .child = std.process.Child.init(argv.items, gpa),
+            .started_ms = Io.Clock.real.now(io).toMilliseconds(),
+            .child = undefined,
+            .pid = undefined,
         };
-        self.child.cwd = cwd;
-        self.child.env_map = &env;
-        self.child.stdin_behavior = .Pipe;
-        self.child.stdout_behavior = .Pipe;
-        self.child.stderr_behavior = .Pipe;
-        try self.child.spawn();
-        self.child.env_map = null;
+        self.child = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = cwd },
+            .environ_map = opts.environ_map,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .create_no_window = true,
+        });
+        self.pid = self.child.id.?;
 
-        self.thread = std.Thread.spawn(.{}, readerMain, .{self}) catch |err| {
-            _ = self.child.kill() catch null;
+        self.stderr_thread = std.Thread.spawn(.{}, stderrMain, .{ self, self.child.stderr.? }) catch |err| {
+            self.child.kill(io);
+            return err;
+        };
+        self.thread = std.Thread.spawn(.{}, readerMain, .{ self, self.child.stdout.? }) catch |err| {
+            self.child.kill(io);
+            self.stderr_thread.?.join();
             return err;
         };
         return self;
@@ -169,8 +183,8 @@ pub const Instance = struct {
     }
 
     pub fn isExited(self: *Instance) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.state == .exited;
     }
 
@@ -191,8 +205,8 @@ pub const Instance = struct {
 
         var sent: Sent = undefined;
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.state == .exited) return error.InstanceExited;
             sent.cursor = self.next_seq;
             // Count the turn before writing so a fast result can't underflow it.
@@ -202,8 +216,8 @@ pub const Instance = struct {
             self.appendEventLocked("prompt", prompt);
         }
         self.writeStdin(line) catch |err| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.pending_turns -|= 1;
             if (self.pending_turns == 0 and self.state == .running) self.state = .idle;
             return err;
@@ -214,8 +228,8 @@ pub const Instance = struct {
     /// Ask claude to abort the current turn (same control message the Agent SDK uses).
     pub fn interrupt(self: *Instance) !void {
         {
-            self.stdin_mutex.lock();
-            defer self.stdin_mutex.unlock();
+            self.stdin_mutex.lockUncancelable(self.io);
+            defer self.stdin_mutex.unlock(self.io);
             const f = self.child.stdin orelse return error.InstanceExited;
             self.next_request_id += 1;
             var buf: [160]u8 = undefined;
@@ -223,10 +237,10 @@ pub const Instance = struct {
                 \\{{"type":"control_request","request_id":"claudegpt-{d}","request":{{"subtype":"interrupt"}}}}
                 \\
             , .{self.next_request_id});
-            try f.writeAll(line);
+            try f.writeStreamingAll(self.io, line);
         }
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         // An interrupted turn may not produce a `result`; don't leave waiters hanging.
         if (self.state != .exited) {
             self.pending_turns = 0;
@@ -241,51 +255,66 @@ pub const Instance = struct {
         self.closeStdin();
         if (self.waitExited(grace_ns)) return;
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.state != .exited) {
                 self.appendEventLocked("kill", "process did not exit; killing it");
-                killProcess(self.child.id);
+                killProcess(self.pid);
             }
         }
         _ = self.waitExited(grace_ns);
     }
 
     pub fn waitExited(self: *Instance, timeout_ns: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var timer = std.time.Timer.start() catch return self.state == .exited;
-        while (self.state != .exited) {
-            const elapsed = timer.read();
-            if (elapsed >= timeout_ns) return false;
-            self.cond.timedWait(&self.mutex, timeout_ns - elapsed) catch {};
-        }
-        return true;
+        return self.waitUntil(timeout_ns, 0, isExitedLocked);
     }
 
     /// Wait until `target_turns` turns completed, the instance went idle, or it exited.
     pub fn waitTurns(self: *Instance, target_turns: u64, timeout_ns: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var timer = std.time.Timer.start() catch return false;
-        while (self.completed_turns < target_turns and self.pending_turns > 0 and self.state != .exited) {
-            const elapsed = timer.read();
-            if (elapsed >= timeout_ns) return false;
-            self.cond.timedWait(&self.mutex, timeout_ns - elapsed) catch {};
-        }
-        return true;
+        return self.waitUntil(timeout_ns, target_turns, turnsDoneLocked);
     }
 
     pub fn waitIdle(self: *Instance, timeout_ns: u64) bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const target = self.completed_turns + self.pending_turns;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         return self.waitTurns(target, timeout_ns);
     }
 
+    fn isExitedLocked(self: *Instance, _: u64) bool {
+        return self.state == .exited;
+    }
+
+    fn turnsDoneLocked(self: *Instance, target_turns: u64) bool {
+        return self.completed_turns >= target_turns or self.pending_turns == 0 or self.state == .exited;
+    }
+
+    fn waitUntil(self: *Instance, timeout_ns: u64, arg: u64, comptime done: fn (*Instance, u64) bool) bool {
+        const io = self.io;
+        const deadline: Io.Clock.Timestamp = .fromNow(io, .{
+            .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            .clock = .awake,
+        });
+        while (true) {
+            // Read the generation before checking, so a change in between wakes us.
+            const gen = self.generation.load(.acquire);
+            self.mutex.lockUncancelable(io);
+            const ok = done(self, arg);
+            self.mutex.unlock(io);
+            if (ok) return true;
+            if (deadline.durationFromNow(io).raw.nanoseconds <= 0) return false;
+            io.futexWaitTimeout(u32, &self.generation.raw, gen, .{ .deadline = deadline }) catch return false;
+        }
+    }
+
+    fn notifyLocked(self: *Instance) void {
+        _ = self.generation.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.generation.raw, std.math.maxInt(u32));
+    }
+
     pub fn info(self: *Instance, arena: Allocator) !Info {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return .{
             .id = self.id(),
             .state = self.state,
@@ -306,8 +335,8 @@ pub const Instance = struct {
 
     /// Copy events with seq >= `since` into `arena`, stopping after roughly `max_bytes` of text.
     pub fn eventsSince(self: *Instance, arena: Allocator, since: u64, max_bytes: usize) !Page {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const first = if (self.events.items.len > 0) self.events.items[0].seq else self.next_seq;
         const start = @min(@max(since, first), self.next_seq);
         var out: std.ArrayList(EventView) = .empty;
@@ -330,86 +359,97 @@ pub const Instance = struct {
     // ---- internals ----
 
     fn writeStdin(self: *Instance, line: []const u8) !void {
-        self.stdin_mutex.lock();
-        defer self.stdin_mutex.unlock();
+        self.stdin_mutex.lockUncancelable(self.io);
+        defer self.stdin_mutex.unlock(self.io);
         const f = self.child.stdin orelse return error.InstanceExited;
-        try f.writeAll(line);
-        try f.writeAll("\n");
+        try f.writeStreamingAll(self.io, line);
+        try f.writeStreamingAll(self.io, "\n");
     }
 
     fn closeStdin(self: *Instance) void {
-        self.stdin_mutex.lock();
-        defer self.stdin_mutex.unlock();
+        self.stdin_mutex.lockUncancelable(self.io);
+        defer self.stdin_mutex.unlock(self.io);
         if (self.child.stdin) |f| {
-            f.close();
+            f.close(self.io);
             self.child.stdin = null;
         }
     }
 
-    fn readerMain(self: *Instance) void {
-        {
-            var poller = std.Io.poll(self.gpa, enum { stdout, stderr }, .{
-                .stdout = self.child.stdout.?,
-                .stderr = self.child.stderr.?,
-            });
-            defer poller.deinit();
-            while (true) {
-                const more = poller.poll() catch |err| {
-                    self.pushEventFmt("error", "reading claude output failed: {s}", .{@errorName(err)});
-                    break;
-                };
-                self.drainStdout(poller.reader(.stdout), !more);
-                self.drainStderr(poller.reader(.stderr));
-                if (!more) break;
-            }
-        }
+    fn stderrMain(self: *Instance, file: Io.File) void {
+        self.readLines(file, .stderr, stderr_buffer_len);
+    }
+
+    /// Owns the process lifecycle: drains stdout, then reaps the child.
+    fn readerMain(self: *Instance, file: Io.File) void {
+        self.readLines(file, .stdout, stdout_buffer_len);
+        if (self.stderr_thread) |t| t.join();
         self.closeStdin();
-        // Child.wait closes the remaining pipes and reaps the process.
-        const term = self.child.wait() catch |err| blk: {
+        // Both readers are done; close the pipes before reaping.
+        if (self.child.stdout) |f| f.close(self.io);
+        if (self.child.stderr) |f| f.close(self.io);
+        self.child.stdout = null;
+        self.child.stderr = null;
+        const term = self.child.wait(self.io) catch |err| blk: {
             self.pushEventFmt("error", "wait failed: {s}", .{@errorName(err)});
             break :blk null;
         };
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.state = .exited;
         self.pending_turns = 0;
         if (term) |t| self.exit_code = switch (t) {
-            .Exited => |c| c,
-            .Signal => |s| -@as(i64, s),
+            .exited => |c| c,
             else => -1,
         };
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "process exited (code {?d})", .{self.exit_code}) catch "process exited";
         self.appendEventLocked("exit", msg);
-        self.cond.broadcast();
     }
 
-    fn drainStdout(self: *Instance, r: *std.Io.Reader, final: bool) void {
+    const Stream = enum { stdout, stderr };
+
+    fn readLines(self: *Instance, file: Io.File, comptime which: Stream, comptime buffer_len: usize) void {
+        const buf = self.gpa.alloc(u8, buffer_len) catch {
+            self.pushEvent("error", "out of memory allocating a pipe buffer");
+            return;
+        };
+        defer self.gpa.free(buf);
+        var fr = file.readerStreaming(self.io, buf);
+        const r = &fr.interface;
         while (true) {
-            const buf = r.buffered();
-            const nl = std.mem.indexOfScalar(u8, buf, '\n') orelse {
-                if (buf.len > max_line or (final and buf.len > 0)) {
-                    self.handleLine(buf);
-                    r.toss(buf.len);
-                }
-                return;
+            const line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                // Longer than the buffer: deliver what we have as one chunk.
+                error.StreamTooLong => {
+                    self.dispatch(which, r.buffered());
+                    r.tossBuffered();
+                    continue;
+                },
+                error.EndOfStream => {
+                    if (r.bufferedLen() > 0) self.dispatch(which, r.buffered());
+                    return;
+                },
+                error.ReadFailed => {
+                    self.pushEventFmt("error", "reading claude {s} failed", .{@tagName(which)});
+                    return;
+                },
             };
-            self.handleLine(buf[0..nl]);
-            r.toss(nl + 1);
+            self.dispatch(which, line);
         }
     }
 
-    fn drainStderr(self: *Instance, r: *std.Io.Reader) void {
-        const buf = r.buffered();
-        if (buf.len == 0) return;
-        const text = std.mem.trim(u8, buf, " \r\n\t");
-        if (text.len > 0) self.pushEvent("stderr", text);
-        r.toss(buf.len);
+    fn dispatch(self: *Instance, comptime which: Stream, line: []const u8) void {
+        switch (which) {
+            .stdout => self.handleLine(line),
+            .stderr => {
+                const text = std.mem.trim(u8, line, " \r\n\t");
+                if (text.len > 0) self.pushEvent("stderr", text);
+            },
+        }
     }
 
     fn handleLine(self: *Instance, raw: []const u8) void {
-        const line = std.mem.trim(u8, raw, " \r\t");
+        const line = std.mem.trim(u8, raw, " \r\n\t");
         if (line.len == 0) return;
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -429,8 +469,8 @@ pub const Instance = struct {
         if (eql(typ, "system")) {
             const sub = jsonx.getStr(v, "subtype") orelse "";
             if (!eql(sub, "init")) return self.pushEvent("system", sub);
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (jsonx.getStr(v, "session_id")) |sid| try self.setSessionLocked(sid);
             const text = try std.fmt.allocPrint(arena, "session {s}, model {s}", .{
                 jsonx.getStr(v, "session_id") orelse "?",
@@ -470,8 +510,8 @@ pub const Instance = struct {
         } else if (eql(typ, "result")) {
             const result = jsonx.getStr(v, "result") orelse jsonx.getStr(v, "subtype") orelse "";
             const is_error = jsonx.getBool(v, "is_error") orelse false;
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.completed_turns += 1;
             self.pending_turns -|= 1;
             if (self.state != .exited) self.state = if (self.pending_turns == 0) .idle else .running;
@@ -482,7 +522,6 @@ pub const Instance = struct {
             self.last_result = owned;
             self.last_result_is_error = is_error;
             self.appendEventLocked(if (is_error) "result_error" else "result", result);
-            self.cond.broadcast();
         } else if (eql(typ, "control_response")) {
             self.pushEvent("control", clip(line, max_detail_text));
         } else if (eql(typ, "stream_event")) {
@@ -502,8 +541,8 @@ pub const Instance = struct {
     }
 
     fn pushEvent(self: *Instance, kind: []const u8, text: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.appendEventLocked(kind, text);
     }
 
@@ -518,7 +557,7 @@ pub const Instance = struct {
             const drop = max_events / 10;
             for (self.events.items[0..drop]) |e| self.gpa.free(e.text);
             const rest = self.events.items.len - drop;
-            std.mem.copyForwards(Event, self.events.items[0..rest], self.events.items[drop..]);
+            @memmove(self.events.items[0..rest], self.events.items[drop..]);
             self.events.shrinkRetainingCapacity(rest);
         }
         self.events.append(self.gpa, .{ .seq = self.next_seq, .kind = kind, .text = owned }) catch {
@@ -526,7 +565,7 @@ pub const Instance = struct {
             return;
         };
         self.next_seq += 1;
-        self.cond.broadcast();
+        self.notifyLocked();
     }
 };
 
@@ -534,9 +573,9 @@ fn killProcess(id: std.process.Child.Id) void {
     // Racy only if the reader thread reaped the process in the instant between our
     // state check and this call; acceptable for a best-effort hard stop.
     if (builtin.os.tag == .windows) {
-        std.os.windows.TerminateProcess(id, 1) catch {};
+        _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1));
     } else {
-        std.posix.kill(id, std.posix.SIG.KILL) catch {};
+        std.posix.kill(id, .KILL) catch {};
     }
 }
 

@@ -2,21 +2,20 @@
 //! closely enough for the integration test: echoes each user turn.
 const std = @import("std");
 
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    const args = try std.process.argsAlloc(arena);
+    const args = try init.minimal.args.toSlice(arena);
     var session: []const u8 = "11111111-2222-4333-8444-555555555555";
     for (args, 0..) |a, i| {
         if (std.mem.eql(u8, a, "--resume") and i + 1 < args.len) session = args[i + 1];
     }
 
     var in_buf: [64 * 1024]u8 = undefined;
-    var stdin = std.fs.File.stdin().reader(&in_buf);
+    var stdin = std.Io.File.stdin().readerStreaming(io, &in_buf);
     var out_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&out_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &out_buf);
     const out = &stdout.interface;
 
     var inited = false;

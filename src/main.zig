@@ -28,14 +28,15 @@ const usage =
 
 const Server = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     reg: *Registry,
     token: []const u8,
 };
 
-pub fn main() !void {
-    const gpa = std.heap.smp_allocator;
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var bind: []const u8 = "127.0.0.1";
     var port: u16 = 8765;
@@ -54,7 +55,7 @@ pub fn main() !void {
             allow_bypass = true;
         } else if (eql(a, "--root")) {
             const dir = nextArg(args, &i);
-            const real = std.fs.cwd().realpathAlloc(gpa, dir) catch |err|
+            const real = std.Io.Dir.cwd().realPathFileAlloc(io, dir, gpa) catch |err|
                 fatal("--root {s}: {s}", .{ dir, @errorName(err) });
             try roots.append(gpa, real);
         } else if (eql(a, "--port")) {
@@ -72,48 +73,52 @@ pub fn main() !void {
     }
     if (roots.items.len == 0) fatal("at least one --root <dir> is required (see --help)", .{});
 
-    const token = std.process.getEnvVarOwned(gpa, "CLAUDEGPT_TOKEN") catch
-        fatal("set CLAUDEGPT_TOKEN to a random secret of at least 16 characters", .{});
+    const env = init.environ_map;
+    const token = try gpa.dupe(u8, env.get("CLAUDEGPT_TOKEN") orelse
+        fatal("set CLAUDEGPT_TOKEN to a random secret of at least 16 characters", .{}));
     if (token.len < 16) fatal("CLAUDEGPT_TOKEN must be at least 16 characters", .{});
+    // claude processes inherit this map; don't hand them the server's secret.
+    _ = env.swapRemove("CLAUDEGPT_TOKEN");
 
-    var reg = Registry.init(gpa, .{
+    var reg = Registry.init(gpa, io, .{
         .claude_path = claude_path,
         .roots = roots.items,
         .max_live = max_live,
         .allow_bypass = allow_bypass,
+        .environ_map = env,
     });
-    var srv: Server = .{ .gpa = gpa, .reg = &reg, .token = token };
+    var srv: Server = .{ .gpa = gpa, .io = io, .reg = &reg, .token = token };
 
-    const addr = std.net.Address.parseIp(bind, port) catch fatal("invalid --bind address '{s}'", .{bind});
-    var listener = addr.listen(.{ .reuse_address = true }) catch |err|
+    const addr = std.Io.net.IpAddress.parse(bind, port) catch fatal("invalid --bind address '{s}'", .{bind});
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch |err|
         fatal("listen on {s}:{d}: {s}", .{ bind, port, @errorName(err) });
-    defer listener.deinit();
+    defer listener.deinit(io);
 
     log.info("claudegpt {s} listening on http://{s}:{d}/mcp", .{ mcp.version, bind, port });
     for (roots.items) |r| log.info("allowed root: {s}", .{r});
     if (allow_bypass) log.warn("bypassPermissions is enabled", .{});
 
     while (true) {
-        const conn = listener.accept() catch |err| {
+        const conn = listener.accept(io) catch |err| {
             log.err("accept: {s}", .{@errorName(err)});
             continue;
         };
         const t = std.Thread.spawn(.{}, handleConn, .{ &srv, conn }) catch |err| {
             log.err("spawn connection thread: {s}", .{@errorName(err)});
-            conn.stream.close();
+            conn.close(io);
             continue;
         };
         t.detach();
     }
 }
 
-fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn handleConn(srv: *Server, conn: std.Io.net.Stream) void {
+    defer conn.close(srv.io);
     var rbuf: [16 * 1024]u8 = undefined;
     var wbuf: [8 * 1024]u8 = undefined;
-    var sr = conn.stream.reader(&rbuf);
-    var sw = conn.stream.writer(&wbuf);
-    const r = sr.interface();
+    var sr = conn.reader(srv.io, &rbuf);
+    var sw = conn.writer(srv.io, &wbuf);
+    const r = &sr.interface;
     const w = &sw.interface;
 
     while (true) {
@@ -174,7 +179,7 @@ fn handleRequest(srv: *Server, arena: std.mem.Allocator, req: http.Request, w: *
     return ka;
 }
 
-fn nextArg(args: []const [:0]u8, i: *usize) []const u8 {
+fn nextArg(args: []const [:0]const u8, i: *usize) []const u8 {
     if (i.* + 1 >= args.len) fatal("{s} needs a value", .{args[i.*]});
     i.* += 1;
     return args[i.*];

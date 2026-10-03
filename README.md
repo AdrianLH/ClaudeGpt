@@ -16,7 +16,7 @@ you allow. It uses your existing Claude Code login and does not need an API key.
 
 ## Build
 
-Requires **Zig 0.15.x** and the `claude` CLI on `PATH`.
+Requires **Zig 0.16.x** and the `claude` CLI on `PATH`.
 
 ```sh
 zig build -Doptimize=ReleaseSafe                         # zig-out/bin/claudegpt

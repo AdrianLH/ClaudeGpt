@@ -381,7 +381,7 @@ test "initialize, list, errors, notifications" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var reg = Registry.init(testing.allocator, .{});
+    var reg = Registry.init(testing.allocator, testing.io, .{});
     defer reg.deinit();
 
     const init = try testCall(&reg, arena,
@@ -417,7 +417,7 @@ test "tool errors are reported as isError results" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var reg = Registry.init(testing.allocator, .{});
+    var reg = Registry.init(testing.allocator, testing.io, .{});
     defer reg.deinit();
 
     const empty = try testCall(&reg, arena,
