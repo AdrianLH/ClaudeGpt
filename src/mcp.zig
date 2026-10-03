@@ -23,7 +23,8 @@ const instructions =
 ;
 
 const default_wait_s = 25;
-const max_wait_s = 120;
+/// Below the ~100 s request timeout of Cloudflare tunnels.
+const max_wait_s = 90;
 const default_max_bytes = 24 * 1024;
 
 pub const tools_json =
@@ -37,7 +38,7 @@ pub const tools_json =
     \\  "permission_mode":{"type":"string","enum":["default","acceptEdits","plan","bypassPermissions"],"description":"default: only read-only and allowed_tools run; acceptEdits: file edits allowed; plan: read-only planning; bypassPermissions: everything (only if the server allows it)."},
     \\  "allowed_tools":{"type":"array","items":{"type":"string"},"description":"Permission rules to pre-approve, e.g. [\"Edit\",\"Bash(git status)\",\"Bash(npm test:*)\"]."},
     \\  "resume_session_id":{"type":"string","description":"Resume an earlier Claude Code session (session_id from a previous instance)."},
-    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":120,"description":"How long to wait for the first prompt's turn to finish. Default 25."}},
+    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":90,"description":"How long to wait for the first prompt's turn to finish. Default 25."}},
     \\  "required":["cwd"],"additionalProperties":false},
     \\ "annotations":{"title":"Start Claude Code","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
     \\{"name":"claude_send","title":"Send prompt to Claude Code",
@@ -45,7 +46,7 @@ pub const tools_json =
     \\ "inputSchema":{"type":"object","properties":{
     \\  "id":{"type":"string","description":"Instance id from claude_start or claude_list."},
     \\  "prompt":{"type":"string"},
-    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":120,"description":"How long to wait for the turn to finish. Default 25."}},
+    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":90,"description":"How long to wait for the turn to finish. Default 25."}},
     \\  "required":["id","prompt"],"additionalProperties":false},
     \\ "annotations":{"title":"Send prompt","readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
     \\{"name":"claude_output","title":"Read Claude Code output",
@@ -53,7 +54,7 @@ pub const tools_json =
     \\ "inputSchema":{"type":"object","properties":{
     \\  "id":{"type":"string"},
     \\  "since":{"type":"integer","minimum":0,"description":"Cursor (next_cursor from a previous call). Default 0."},
-    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":120,"description":"Wait up to this long for running turns to finish. Default 0."},
+    \\  "wait_seconds":{"type":"integer","minimum":0,"maximum":90,"description":"Wait up to this long for running turns to finish. Default 0."},
     \\  "max_bytes":{"type":"integer","minimum":1000,"maximum":200000,"description":"Approximate cap on returned text. Default 24576."}},
     \\  "required":["id"],"additionalProperties":false},
     \\ "annotations":{"title":"Read output","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},

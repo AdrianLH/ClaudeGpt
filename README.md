@@ -72,7 +72,7 @@ Any MCP client that speaks Streamable HTTP works too, e.g.
 | `claude_interrupt` | `id` | Aborts the current turn. |
 | `claude_stop` | `id` | Ends the process. The transcript stays readable and the session can be resumed. |
 
-`wait_seconds` defaults to 25 for start/send. If a turn takes longer, the result says
+`wait_seconds` defaults to 25 for start/send and is capped at 90, below the ~100 s request timeout of Cloudflare tunnels. If a turn takes longer, the result says
 `completed: false` and ChatGPT follows up with `claude_output since=<next_cursor>`.
 
 The transcript contains `prompt`, `init`, `text`, `tool_use`, `tool_result`/`tool_error`,
