@@ -24,22 +24,24 @@ jobs:
         run: |
           zig build fake
           $root = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\lroot").FullName
-          $job = Start-Job {
-            param($s, $c, $r)
-            & $s -NoTunnel -Port 18766 -Claude $c -Root $r
-          } -ArgumentList "$PWD\scripts\start.ps1", "$PWD\zig-out\bin\fake_claude.exe", $root
+          $log = "$env:RUNNER_TEMP\launcher.log"
+          $launcherArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PWD\scripts\start.ps1`"",
+            "-NoTunnel", "-Port", "18766", "-Claude", "`"$PWD\zig-out\bin\fake_claude.exe`"", "-Root", "`"$root`"")
+          $p = Start-Process powershell -ArgumentList $launcherArgs -PassThru -NoNewWindow `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err"
           $ok = $false
           for ($i = 0; $i -lt 60 -and -not $ok; $i++) {
             Start-Sleep 1
-            try { $ok = (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18766/healthz).StatusCode -eq 200 } catch {}
+            try { $ok = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://127.0.0.1:18766/healthz).StatusCode -eq 200 } catch {}
           }
-          Receive-Job $job
+          Get-Content $log, "$log.err" -ErrorAction SilentlyContinue
           if (-not $ok) { throw "launcher did not start the server" }
           $tok = (Get-Content -Raw "$env:USERPROFILE\.claudegpt\token").Trim()
           $body = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
           $r = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18766/mcp -Headers @{ Authorization = "Bearer $tok" } -ContentType application/json -Body $body
           if ($r.result.tools.Count -ne 6) { throw "unexpected tools/list: $($r | ConvertTo-Json -Depth 5)" }
-          Stop-Job $job
+          Stop-Process -Id $p.Id -Force
+          Get-Process claudegpt -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "launcher: PASS"
 
   windows-release:
