@@ -1,0 +1,21 @@
+name: probe-std
+on:
+  push:
+    branches: [claude/sleepy-wright-r04avo]
+    paths: [.github/workflows/probe.yml]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: |
+          LIB=$(zig env | sed -n 's/.*"lib_dir": *"\([^"]*\)".*/\1/p'); [ -n "$LIB" ] || LIB=$(zig env | grep -o '"[^"]*/lib"' | head -1 | tr -d '"')
+          echo "LIB=$LIB"; cd "$LIB/std"
+          echo "### FILES"; find . -maxdepth 2 -name '*.zig' | sort | tr '\n' ' '; echo
+          for f in start.zig process.zig process/Child.zig process/Init.zig Thread.zig Thread/Mutex.zig Thread/Condition.zig time.zig Io.zig Io/net.zig Io/File.zig Io/Dir.zig Io/Threaded.zig Io/Reader.zig Io/Writer.zig crypto.zig json/Stringify.zig heap.zig; do
+            [ -f "$f" ] || { echo "### MISSING $f"; continue; }
+            echo "### $f"
+            grep -nE '^\s*pub (fn|const|var) [A-Za-z_]+' "$f" | grep -vE '^\s*[0-9]+:\s{12,}' | cut -c1-200
+          done
