@@ -14,7 +14,18 @@ ChatGPT ──HTTPS──> tunnel (cloudflared / ngrok) ──> claudegpt 127.0.
 Each instance is one long-lived `claude` process in headless stream-json mode, running in a directory
 you allow. It uses your existing Claude Code login and does not need an API key.
 
-## Build
+## Quick start (Windows)
+
+1. Install [Zig 0.16](https://ziglang.org/download/) and Claude Code, and check that `claude -p "hi"` answers.
+2. Double-click **`start.cmd`** (or run `.\start.cmd` in the repo).
+   - The first run builds the server, creates a secret token in `%USERPROFILE%\.claudegpt\token`,
+     and installs `cloudflared` with winget if it's missing.
+   - It prints the **Connector URL** (also copied to the clipboard) and the **Bearer token**.
+3. In ChatGPT, add a connector with that URL and token (see [Connect ChatGPT](#connect-chatgpt)).
+
+By default Claude Code may work in the folder that contains this repo (for example `D:\Repos`).
+To choose different folders, run `.\start.cmd -Root C:\src,D:\work`. Use `-NoTunnel` for local-only use.
+
 
 Requires **Zig 0.16.x** and the `claude` CLI on `PATH`.
 
