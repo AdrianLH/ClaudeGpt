@@ -11,11 +11,44 @@ jobs:
         with:
           version: 0.16.0
       - run: |
-          LIB=$(zig env | sed -n 's/.*"lib_dir": *"\([^"]*\)".*/\1/p'); [ -n "$LIB" ] || LIB=$(zig env | grep -o '"[^"]*/lib"' | head -1 | tr -d '"')
-          echo "LIB=$LIB"; cd "$LIB/std"
-          echo "### FILES"; find . -maxdepth 2 -name '*.zig' | sort | tr '\n' ' '; echo
-          for f in start.zig process.zig process/Child.zig process/Init.zig Thread.zig Thread/Mutex.zig Thread/Condition.zig time.zig Io.zig Io/net.zig Io/File.zig Io/Dir.zig Io/Threaded.zig Io/Reader.zig Io/Writer.zig crypto.zig json/Stringify.zig heap.zig; do
-            [ -f "$f" ] || { echo "### MISSING $f"; continue; }
-            echo "### $f"
-            grep -nE '^\s*pub (fn|const|var) [A-Za-z_]+' "$f" | grep -vE '^\s*[0-9]+:\s{12,}' | cut -c1-200
-          done
+          LIB=$(dirname $(dirname $(which zig)))/lib; [ -d "$LIB/std" ] || LIB=$(dirname $(which zig))/lib
+          cd "$LIB/std"
+          p() { echo "### $1:$2"; sed -n "$2p" "$1" | grep -vE '^\s*///?' ; }
+          p process.zig 25,60
+          p process.zig 315,455
+          p process/Child.zig 1,160
+          grep -nE 'pub (fn|const)' process/Environ.zig | head -40
+          grep -nE 'pub (fn|const)' process/Args.zig | head -30
+          p Io.zig 1587,1600
+          p Io.zig 1653,1670
+          p Io.zig 1766,1870
+          p Io.zig 2326,2400
+          p Io.zig 2468,2500
+          p Io/net.zig 224,250
+          p Io/net.zig 1243,1460
+          p Io/File.zig 91,140
+          p Io/File.zig 560,640
+          echo "### MultiReader"; grep -vE '^\s*///?' Io/File/MultiReader.zig | head -250
+          p Io/Dir.zig 903,1000
+          p Io/Threaded.zig 1573,1680
+          echo "### start.zig main"; grep -nE 'Init|main\(|callMain|juicy' start.zig | head -40
+          echo "### testing io"; grep -nE 'pub (var|const|fn) (io|allocator|tmpDir|TmpDir)' testing.zig
+          grep -nE 'pub fn (realPath|path)' testing.zig | head
+          echo "### Thread misc"; grep -nE 'Mutex|Condition|sleep' Thread.zig | head
+          echo "### Build"; grep -nE 'pub fn (addExecutable|addTest|createModule|addRunArtifact|addInstallArtifact|standardTargetOptions)' Build.zig
+          echo "### posix kill"; grep -nE 'pub fn kill|pub const SIG\b' posix.zig | head
+          echo "### windows Terminate"; grep -nE 'pub fn TerminateProcess' os/windows.zig
+  zig17:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig version
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+      - run: zig version
